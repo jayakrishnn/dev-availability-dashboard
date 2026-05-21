@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Project Dashboard</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/msal-browser/3.7.1/msal-browser.min.js"></script>
+<script src="https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js"></script>
 <style>
 :root {
   --bg: #f4f6fb;
@@ -349,7 +349,7 @@ const msalConfig = {
 async function signIn() {
   try {
     msalInstance = new msal.PublicClientApplication(msalConfig);
-    await msalInstance.initialize();
+    
     await msalInstance.loginPopup({ scopes: ['https://bpterp.sharepoint.com/.default'] });
     document.getElementById('auth-screen').style.display = 'none';
     document.getElementById('app').style.display = 'block';
