@@ -412,7 +412,7 @@ let currentGroupBy = '', visibleColumns = null;
 let refreshTimer = null;
 
 const msalConfig = {
-  auth: { clientId: CONFIG.clientId, authority: `https://login.microsoftonline.com/${CONFIG.tenantId}`, redirectUri: CONFIG.redirectUri },
+  auth: { clientId: CONFIG.clientId, authority: 'https://login.microsoftonline.com/22b1f654-f802-43a4-b6ef-903244e68b81', redirectUri: CONFIG.redirectUri },
   cache: { cacheLocation: 'sessionStorage' }
 };
 
@@ -420,7 +420,7 @@ async function signIn() {
   try {
     msalInstance = new msal.PublicClientApplication(msalConfig);
     
-    await msalInstance.loginPopup({ scopes: ['https://bpterp.sharepoint.com/.default'] });
+    await msalInstance.loginPopup({ scopes: ['https://graph.microsoft.com/Sites.Read.All', 'https://graph.microsoft.com/User.Read'] });
     document.getElementById('auth-screen').style.display = 'none';
     document.getElementById('app').style.display = 'block';
     const acc = msalInstance.getAllAccounts()[0];
@@ -440,9 +440,9 @@ function signOut() {
 async function getToken() {
   const acc = msalInstance.getAllAccounts()[0];
   const result = await msalInstance.acquireTokenSilent({
-    scopes: ['https://bpterp.sharepoint.com/.default'],
+    scopes: ['https://graph.microsoft.com/Sites.Read.All'],
     account: acc
-  }).catch(() => msalInstance.acquireTokenPopup({ scopes: ['https://bpterp.sharepoint.com/.default'] }));
+  }).catch(() => msalInstance.acquireTokenPopup({ scopes: ['https://graph.microsoft.com/Sites.Read.All'] }));
   return result.accessToken;
 }
 
@@ -452,22 +452,49 @@ async function loadData() {
   if (iconEl) iconEl.classList.add('spinning');
   try {
     const token = await getToken();
-    const select = [
-      'Title','ProjectName','Status','ProjectManager/Title','AssignedTo/Title',
+
+    // Step 1: Get site ID from Graph
+    const siteResp = await fetch(
+      'https://graph.microsoft.com/v1.0/sites/bpterp.sharepoint.com:/sites/DailyExecution',
+      { headers: { 'Authorization': `Bearer ${token}` } }
+    );
+    if (!siteResp.ok) throw new Error(`Site lookup failed: ${siteResp.status} ${await siteResp.text()}`);
+    const siteData = await siteResp.json();
+    const siteId = siteData.id;
+
+    // Step 2: Get list ID
+    const listResp = await fetch(
+      `https://graph.microsoft.com/v1.0/sites/${siteId}/lists?$filter=displayName eq '${encodeURIComponent(CONFIG.listName)}'&$select=id,displayName`,
+      { headers: { 'Authorization': `Bearer ${token}` } }
+    );
+    if (!listResp.ok) throw new Error(`List lookup failed: ${listResp.status}`);
+    const listData = await listResp.json();
+    if (!listData.value?.length) throw new Error(`List '${CONFIG.listName}' not found`);
+    const listId = listData.value[0].id;
+
+    // Step 3: Fetch all items with fields expanded
+    let allFetched = [], nextLink = null;
+    const fields = [
+      'Title','ProjectName','Status','ProjectManager','AssignedTo',
       'Progress_x0025_','TaskType','RICEFWType','PlannedStartDate','PlannnedDueDate',
       'ActualStartDate','ActualEndDate','EffortsinDays','Efforts_x0028_Timesheet_x0029_',
-      'Module','RequestedBy/Title','L1Reviewer/Title','L2Reviewer/Title','TaskLead/Title',
+      'Module','RequestedBy','L1Reviewer','L2Reviewer','TaskLead',
       'Priority','Complexity','IsBlocked','BlockedReason','Overdue','L1ApprovalStatus',
       'L2ApprovalStatus','RequirementCompleted','BuildCompleted','UTCompleted',
       'DocumentationCompleted','L1ReviewCompleted','L2ReviewCompleted',
       'FUT1Completed','TRQASCompleted','FUT2Completed','UATCompleted','TRPRDCompleted','Modified'
     ].join(',');
-    const expand = 'AssignedTo,ProjectManager,L1Reviewer,L2Reviewer,TaskLead,RequestedBy';
-    const url = `${CONFIG.siteUrl}/_api/web/lists/getbytitle('${encodeURIComponent(CONFIG.listName)}')/items?$select=${select}&$expand=${expand}&$top=5000`;
-    const resp = await fetch(url, { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json;odata=nometadata' } });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
-    const data = await resp.json();
-    allItems = (data.value || []).map(normalizeItem);
+    let itemsUrl = `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${listId}/items?expand=fields(select=${fields})&$top=999`;
+
+    do {
+      const r = await fetch(nextLink || itemsUrl, { headers: { 'Authorization': `Bearer ${token}` } });
+      if (!r.ok) throw new Error(`Items fetch failed: ${r.status} ${await r.text()}`);
+      const d = await r.json();
+      allFetched = allFetched.concat(d.value || []);
+      nextLink = d['@odata.nextLink'] || null;
+    } while (nextLink);
+
+    allItems = allFetched.map(item => normalizeItem(item.fields || item));
     populateSidebarFilters();
     applyGlobalFilter();
     const now = new Date();
@@ -481,17 +508,26 @@ async function loadData() {
 
 function normalizeItem(item) {
   const arr = v => Array.isArray(v) ? v[0] || '' : (v || '');
+  // Graph API returns user fields as "LookupValue" or plain string
+  const user = v => {
+    if (!v) return '';
+    if (typeof v === 'string') return v;
+    if (v.LookupValue) return v.LookupValue;
+    if (v.Title) return v.Title;
+    if (Array.isArray(v)) return v.map(u => u.LookupValue || u.Title || u).join(', ');
+    return String(v);
+  };
   return {
-    id: item.ID || item.Id,
+    id: item.ID || item.Id || item.id,
     title: item.Title || '',
     project: arr(item.ProjectName),
     status: item.Status || '',
-    pm: item.ProjectManager?.Title || '',
-    assignee: item.AssignedTo?.Title || '',
-    taskLead: item.TaskLead?.Title || '',
-    l1reviewer: item.L1Reviewer?.Title || '',
-    l2reviewer: item.L2Reviewer?.Title || '',
-    requestedBy: item.RequestedBy?.Title || '',
+    pm: user(item.ProjectManager),
+    assignee: user(item.AssignedTo),
+    taskLead: user(item.TaskLead),
+    l1reviewer: user(item.L1Reviewer),
+    l2reviewer: user(item.L2Reviewer),
+    requestedBy: user(item.RequestedBy),
     progress: item.Progress_x0025_ || 0,
     taskType: item.TaskType || '',
     ricefw: arr(item.RICEFWType),
